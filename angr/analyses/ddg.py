@@ -242,6 +242,10 @@ class LiveDefinitions(object):
                 offset += 1
 
             self._defs[variable] = { location }
+            for var in self._defs:
+                if isinstance(var, SimMemoryVariable):
+                    if var.addr == variable.addr:
+                        self._defs[var] = { location }
 
         else:
             l.error('Unsupported variable type "%s".', type(variable))
@@ -741,7 +745,7 @@ class DDG(Analysis):
             matches = len(match_suc) == len(successing_nodes) and len(match_state) == len(final_states)
 
             for state in final_states:
-                if not matches and state.history.jumpkind == 'Ijk_FakeRet' and len(final_states) > 1:
+                if state.history.jumpkind == 'Ijk_FakeRet' and len(final_states) > 1:
                     # Skip fakerets if there are other control flow transitions available
                     continue
 
