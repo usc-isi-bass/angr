@@ -24,7 +24,6 @@ def run_underconstrained_ddg(arch):
     target_block = proj.factory.block(addr=target_block_addr)
     tgt_stmt_idx, tgt_stmt = get_target_stmt(proj, target_block)
     assert tgt_stmt_idx is not None
-    buf_addr = tgt_stmt.data.addr.con.value
     tgt_ddg_node = get_ddg_node(ddg, target_block_addr, tgt_stmt_idx)
     assert tgt_ddg_node is not None
 
@@ -33,19 +32,19 @@ def run_underconstrained_ddg(arch):
     for pred in ddg.get_predecessors(tgt_ddg_node):
         pred_block = proj.factory.block(addr=pred.block_addr)
         stmt = pred_block.vex.statements[pred.stmt_idx]
-        has_correct_dependency |= check_dependency(stmt, buf_addr, ord('b'))
+        has_correct_dependency |= check_dependency(stmt, ord('b'))
 
         # If the target depends on the statement assigning 'a' to the global variable, it is underconstrained (this assignment should be overwritten by the 'b' assignment)
-        nose.tools.assert_false(check_dependency(stmt, buf_addr, ord('a')), msg="Target statement has incorrect dependency (DDG is underconstrained)")
+        nose.tools.assert_false(check_dependency(stmt, ord('a')), msg="Target statement has incorrect dependency (DDG is underconstrained)")
     nose.tools.assert_true(has_correct_dependency, msg='Target statement does not have correct dependency (DDG is overconstrained)')
             
 
 
-def check_dependency(stmt, addr, const):
+def check_dependency(stmt, const):
     # Check if we are storing a constant to a variable with constant address
-    if stmt.tag == 'Ist_Store' and stmt.addr.tag == 'Iex_Const' and stmt.data.tag == 'Iex_Const':
+    if stmt.tag == 'Ist_Store' and stmt.data.tag == 'Iex_Const':
         # Check if we are storing the specified constant to the specified variable address
-        if stmt.addr.con.value == addr and stmt.data.con.value == const:
+        if stmt.data.con.value == const:
             return True
     
     return False
