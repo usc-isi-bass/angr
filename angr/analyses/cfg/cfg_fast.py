@@ -18,11 +18,11 @@ from ...knowledge_plugins.cfg import CFGNode, MemoryDataSort, MemoryData
 from ...knowledge_plugins.xrefs import XRef, XRefType
 from ...misc.ux import deprecated
 from ... import sim_options as o
-from ...errors import (AngrCFGError, SimEngineError, SimMemoryError, SimTranslationError, SimValueError,
-                       AngrUnsupportedSyscallError
+from ...errors import (AngrCFGError, AngrSkipJobNotice, AngrUnsupportedSyscallError, SimEngineError, SimMemoryError,
+                       SimTranslationError, SimValueError, SimOperationError, SimError
                        )
 from ...utils.constants import DEFAULT_STATEMENT
-from ..forward_analysis import ForwardAnalysis, AngrSkipJobNotice
+from ..forward_analysis import ForwardAnalysis
 from .cfg_arch_options import CFGArchOptions
 from .cfg_base import CFGBase
 from .segment_list import SegmentList
@@ -1113,16 +1113,26 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                 self._insert_job(job)
                 return
 
-            job = self._pop_pending_job(returning=False)
-            if job is not None:
-                self._insert_job(job)
-                return
-
         # Try to see if there is any indirect jump left to be resolved
+        # it's possible that certain indirect jumps must be resolved before the returning status of a function can be
+        # determined. e.g., in AArch64
+        # __stubs:00000001000064B0 ___stack_chk_fail
+        # __stubs:00000001000064B0                 NOP
+        # __stubs:00000001000064B4                 LDR             X16, =__imp____stack_chk_fail
+        # __stubs:00000001000064B8                 BR              X16
+        #
+        # we need to rely on indirect jump resolving to identify this call to stack_chk_fail before knowing that
+        # function 0x100006480 does not return. Hence, we resolve indirect jumps before popping undecided pending jobs.
         if self._resolve_indirect_jumps and self._indirect_jumps_to_resolve:
             self._process_unresolved_indirect_jumps()
 
             if self._job_info_queue:
+                return
+
+        if self._pending_jobs:
+            job = self._pop_pending_job(returning=False)
+            if job is not None:
+                self._insert_job(job)
                 return
 
         if self._use_function_prologues and self._remaining_function_prologue_addrs:
@@ -1146,8 +1156,14 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
 
             if addr is not None:
                 # if this is ARM and addr % 4 != 0, it has to be THUMB
-                if is_arm_arch(self.project.arch) and addr % 2 == 0 and addr % 4 != 0:
-                    addr |= 1
+                if is_arm_arch(self.project.arch):
+                    if addr % 2 == 0 and addr % 4 != 0:
+                        addr |= 1
+                    else:
+                        # load 8 bytes and test with THUMB-mode prologues
+                        bytes_prefix = self._fast_memory_load_bytes(addr, 8)
+                        if any(re.match(prolog, bytes_prefix) for prolog in self.project.arch.thumb_prologs):
+                            addr |= 1
                 job = CFGJob(addr, addr, "Ijk_Boring", last_addr=None, job_type=CFGJob.JOB_TYPE_COMPLETE_SCANNING)
                 self._insert_job(job)
                 self._register_analysis_job(addr, job)
@@ -1615,10 +1631,13 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                             jobs += self._create_job_call(cfg_node.addr, irsb, cfg_node, stmt_idx, ins_addr,
                                                           current_function_addr, resolved_target, jumpkind)
                         else:
+                            to_outside, target_func_addr = self._is_branching_to_outside(addr, resolved_target,
+                                                                                         current_function_addr)
                             edge = FunctionTransitionEdge(cfg_node, resolved_target, current_function_addr,
-                                                          to_outside=False, stmt_idx=stmt_idx, ins_addr=ins_addr,
+                                                          to_outside=to_outside, stmt_idx=stmt_idx, ins_addr=ins_addr,
+                                                          dst_func_addr=target_func_addr,
                                                           )
-                            ce = CFGJob(resolved_target, current_function_addr, jumpkind,
+                            ce = CFGJob(resolved_target, target_func_addr, jumpkind,
                                         last_addr=resolved_target, src_node=cfg_node, src_stmt_idx=stmt_idx,
                                         src_ins_addr=ins_addr, func_edges=[ edge ],
                                         )
@@ -1672,23 +1691,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
 
             # pylint: disable=too-many-nested-blocks
             if jumpkind in ('Ijk_Boring', 'Ijk_InvalICache'):
-                # if the target address is at another section, it has to be jumping to a new function
-                if not self._addrs_belong_to_same_section(addr, target_addr):
-                    target_func_addr = target_addr
-                    to_outside = True
-                else:
-                    # it might be a jumpout
-                    target_func_addr = None
-                    real_target_addr = get_real_address_if_arm(self.project.arch, target_addr)
-                    if real_target_addr in self._traced_addresses:
-                        node = self.model.get_any_node(target_addr)
-                        if node is not None:
-                            target_func_addr = node.function_address
-                    if target_func_addr is None:
-                        target_func_addr = current_function_addr
-
-                    to_outside = not target_func_addr == current_function_addr
-
+                to_outside, target_func_addr = self._is_branching_to_outside(addr, target_addr, current_function_addr)
                 edge = FunctionTransitionEdge(cfg_node, target_addr, current_function_addr,
                                               to_outside=to_outside,
                                               dst_func_addr=target_func_addr,
@@ -1737,15 +1740,19 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
             # Fix the target_addr for syscalls
             tmp_state = self.project.factory.blank_state(mode="fastpath", addr=cfg_node.addr)
             # Find the first successor with a syscall jumpkind
-            succ = next(iter(succ for succ in self.project.factory.successors(tmp_state).flat_successors
-                             if succ.history.jumpkind and succ.history.jumpkind.startswith("Ijk_Sys")), None)
+            successors = self._simulate_block_with_resilience(tmp_state)
+            if successors is not None:
+                succ = next(iter(succ for succ in successors.flat_successors
+                                 if succ.history.jumpkind and succ.history.jumpkind.startswith("Ijk_Sys")), None)
+            else:
+                succ = None
             if succ is None:
                 # For some reason, there is no such successor with a syscall jumpkind
                 target_addr = self._unresolvable_call_target_addr
             else:
                 try:
                     syscall_stub = self.project.simos.syscall(succ)
-                    if syscall_stub:  # can be None if simos is not a subclass of SimUserspac
+                    if syscall_stub:  # can be None if simos is not a subclass of SimUserspace
                         syscall_addr = syscall_stub.addr
                         target_addr = syscall_addr
                     else:
@@ -1837,6 +1844,60 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
 
 
         return jobs
+
+    def _simulate_block_with_resilience(self, state):
+        """
+        Execute a basic block with "On Error Resume Next". Give up when there is no way moving forward.
+
+        :param SimState state:  The initial state to start simulation with.
+        :return:                A SimSuccessors instance or None if we are unable to resume execution with resilience.
+        :rtype:                 SimSuccessors or None
+        """
+
+        stmt_idx = 0
+        successors = None  # make PyCharm's linting happy
+
+        while True:
+            try:
+                successors = self.project.factory.successors(state, skip_stmts=stmt_idx)
+                break
+            except SimOperationError as ex:
+                stmt_idx = ex.stmt_idx + 1
+                continue
+            except SimError:
+                return None
+
+        return successors
+
+    def _is_branching_to_outside(self, src_addr, target_addr, current_function_addr):
+        """
+        Determine if a branch is branching to a different function (i.e., branching to outside the current function).
+
+        :param int src_addr:    The source address.
+        :param int target_addr: The destination address.
+        :param int current_function_addr:   Address of the current function.
+        :return:    A tuple of (to_outside, target_func_addr)
+        :rtype:     tuple
+        """
+
+        if not self._addrs_belong_to_same_section(src_addr, target_addr):
+            # if the target address is at another section, it has to be jumping to a new function
+            target_func_addr = target_addr
+            to_outside = True
+        else:
+            # it might be a jumpout
+            target_func_addr = None
+            real_target_addr = get_real_address_if_arm(self.project.arch, target_addr)
+            if real_target_addr in self._traced_addresses:
+                node = self.model.get_any_node(target_addr)
+                if node is not None:
+                    target_func_addr = node.function_address
+            if target_func_addr is None:
+                target_func_addr = current_function_addr
+
+            to_outside = not target_func_addr == current_function_addr
+
+        return to_outside, target_func_addr
 
     # Data reference processing
 
@@ -2812,7 +2873,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                 self._pending_jobs.add_nonreturning_function(nonreturning_function.addr)
                 if nonreturning_function.addr in self._function_returns:
                     for fr in self._function_returns[nonreturning_function.addr]:
-                        # Remove all those FakeRet edges
+                        # Remove all pending FakeRet edges
                         if self.kb.functions.contains_addr(fr.caller_func_addr) and \
                                 self.kb.functions.get_by_addr(fr.caller_func_addr).returning is not True:
                             self._updated_nonreturning_functions.add(fr.caller_func_addr)

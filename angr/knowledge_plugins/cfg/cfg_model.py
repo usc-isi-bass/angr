@@ -22,8 +22,8 @@ class CFGModel(Serializable):
     This class describes a Control Flow Graph for a specific range of code.
     """
 
-    __slots__ = ('ident', 'graph', 'jump_tables', 'memory_data', 'insn_addr_to_memory_data', 'references',
-                 '_nodes_by_addr', '_nodes', '_cfg_manager', '_iropt_level', )
+    __slots__ = ('ident', 'graph', 'jump_tables', 'memory_data', 'insn_addr_to_memory_data', '_nodes_by_addr',
+                 '_nodes', '_cfg_manager', '_iropt_level', )
 
     def __init__(self, ident, cfg_manager=None):
 
@@ -63,6 +63,22 @@ class CFGModel(Serializable):
     #
     # Serialization
     #
+
+    def __getstate__(self):
+        state = dict(map(
+            lambda x: (x, self.__getattribute__(x)),
+            self.__slots__
+        ))
+
+        return state
+
+    def __setstate__(self, state):
+        for attribute, value in state.items():
+            self.__setattr__(attribute, value)
+
+        for addr in self._nodes:
+            node = self._nodes[addr]
+            node._cfg_model = self
 
     @classmethod
     def _get_cmsg(cls):

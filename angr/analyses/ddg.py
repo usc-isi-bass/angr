@@ -103,7 +103,7 @@ class LiveDefinitions(object):
 
         # byte-to-byte mappings
         # TODO: make it copy-on-write in order to save memory.
-        # TODO: options are either cooldict.COWDict or a modified version of simuvex.SimPagedMemory
+        # TODO: options are either collections.ChainMap or a modified version of simuvex.SimPagedMemory
         self._memory_map = defaultdict(set)
         self._register_map = defaultdict(set)
         self._defs = defaultdict(set)
@@ -741,7 +741,7 @@ class DDG(Analysis):
             matches = len(match_suc) == len(successing_nodes) and len(match_state) == len(final_states)
 
             for state in final_states:
-                if not matches and state.history.jumpkind == 'Ijk_FakeRet' and len(final_states) > 1:
+                if state.history.jumpkind == 'Ijk_FakeRet' and len(final_states) > 1:
                     # Skip fakerets if there are other control flow transitions available
                     continue
 

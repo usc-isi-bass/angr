@@ -24,17 +24,24 @@ class SimEngineRDVEX(
         self._current_local_call_depth = current_local_call_depth
         self._maximum_local_call_depth = maximum_local_call_depth
         self._function_handler = function_handler
+        self._visited_blocks = None
 
     def process(self, state, *args, **kwargs):
+        self._visited_blocks = kwargs.pop('visited_blocks', None)
+
         # we are using a completely different state. Therefore, we directly call our _process() method before
         # SimEngine becomes flexible enough.
         try:
-            self._process(state, None, block=kwargs.pop('block', None))
+            self._process(
+                state,
+                None,
+                block=kwargs.pop('block', None),
+            )
         except SimEngineError as e:
             if kwargs.pop('fail_fast', False) is True:
                 raise e
             l.error(e)
-        return self.state
+        return self.state, self._visited_blocks
 
     #
     # Private methods
@@ -61,6 +68,10 @@ class SimEngineRDVEX(
     def _handle_WrTmp(self, stmt):
         super()._handle_WrTmp(stmt)
         self.state.kill_and_add_definition(Tmp(stmt.tmp), self._codeloc(), self.tmps[stmt.tmp])
+
+    def _handle_WrTmpData(self, tmp, data):
+        super()._handle_WrTmpData(tmp, data)
+        self.state.kill_and_add_definition(Tmp(tmp), self._codeloc(), self.tmps[tmp])
 
     # e.g. PUT(rsp) = t2, t2 might include multiple values
     def _handle_Put(self, stmt):
@@ -441,16 +452,14 @@ class SimEngineRDVEX(
                 l.warning('Please implement the unknown function handler with your own logic.')
             return None
 
-        is_internal = False
         ext_func_name = None
-        if self.project.loader.main_object.contains_addr(ip_addr) is True:
+        if self.project.loader.main_object.contains_addr(ip_addr):
             ext_func_name = self.project.loader.find_plt_stub_name(ip_addr)
-            if ext_func_name is None:
-                is_internal = True
         else:
             symbol = self.project.loader.find_symbol(ip_addr)
             if symbol is not None:
                 ext_func_name = symbol.name
+        is_internal = ext_func_name is None
 
         executed_rda = False
         if ext_func_name is not None:
