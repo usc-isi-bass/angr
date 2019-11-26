@@ -1181,7 +1181,11 @@ class DDG(Analysis):
                 self._data_graph_add_edge(self._temp_variables[tmp_dep], pv)
 
         if self._custom_data_per_statement is not None:
-            self._temp_register_symbols[tmp] = self._custom_data_per_statement
+            if statement.data.tag == 'Iex_Load' and isinstance(statement.data.addr, pyvex.expr.RdTmp):
+                # If we're working with a load statement, do not inheret sort and offset from the tmp we are loading from.
+                pass
+            else:
+                self._temp_register_symbols[tmp] = self._custom_data_per_statement
 
         for data in self._variables_per_statement:
             self._data_graph_add_edge(data, pv)
